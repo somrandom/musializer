@@ -165,6 +165,14 @@ typedef int Nob_Proc;
 #define NOB_INVALID_PROC -1
 #endif // _WIN32
 
+typedef int Fd;
+typedef struct {
+    Fd read;
+    Fd write;
+} Pipe;
+Pipe pipe_make(void);
+
+
 // Wait until the process has finished
 bool nob_proc_wait(Nob_Proc proc);
 
@@ -174,6 +182,9 @@ typedef struct {
     size_t count;
     size_t capacity;
 } Nob_Cmd;
+
+Nob_Proc nob_cmd_run_async_io(Nob_Cmd cmd, Fd *fdin, Fd *fdout);
+bool nob_cmd_run_sync_io(Nob_Cmd cmd, Nob_String_Builder *in, Nob_String_Builder *out);
 
 // Render a string representation of a command into a string builder. Keep in mind the the
 // string builder is not NULL-terminated by default. Use nob_sb_append_null if you plan to
@@ -446,6 +457,100 @@ defer:
     close(dst_fd);
     return result;
 #endif
+}
+
+Pipe pipe_make(void)
+{
+    Pipe pip = {0};
+
+    Fd pipefd[2];
+    if (pipe(pipefd) < 0) {
+        nob_log(NOB_ERROR, "Could not create pipe: %s", strerror(errno));
+        exit(1);
+    }
+
+    pip.read = pipefd[0];
+    pip.write = pipefd[1];
+
+    return pip;
+}
+
+Nob_Proc nob_cmd_run_async_io(Nob_Cmd cmd, Fd *fdin, Fd *fdout)
+{
+    {
+        Nob_String_Builder sb = {0};
+        nob_cmd_render(cmd, &sb);
+        nob_sb_append_null(&sb);
+        nob_log(NOB_INFO, "CMD: %s", sb.items);
+        nob_sb_free(sb);
+    }
+
+    pid_t cpid = fork();
+    if (cpid < 0) {
+        nob_log(NOB_ERROR, "Could not fork child process: %s", strerror(errno));
+        return NOB_INVALID_PROC;
+    }
+
+    if (cpid == 0) {
+
+        if (fdin) {
+            if (dup2(*fdin, STDIN_FILENO) < 0) {
+                nob_log(NOB_ERROR, "Could not setup stdin for child process: %s", strerror(errno));
+                exit(1);
+            }
+        }
+
+        if (fdout) {
+            if (dup2(*fdout, STDOUT_FILENO) < 0) {
+                nob_log(NOB_ERROR, "Could not setup stdout for child process: %s", strerror(errno));
+                exit(1);
+            }
+        }
+
+        if (execvp(cmd.items[0], (char * const*) cmd.items) < 0) {
+            nob_log(NOB_ERROR, "Could not exec child process: %s", strerror(errno));
+            exit(1);
+        }
+        NOB_ASSERT(0 && "unreachable");
+    }
+
+    return cpid;
+}
+
+bool nob_cmd_run_sync_io(Nob_Cmd cmd, Nob_String_Builder *in, Nob_String_Builder *out)
+{
+    Nob_Proc p = 0;
+    Pipe pip = {0}; // need two pipes?
+
+    Fd *fdin = NULL; // may or may not have input
+
+    pip = pipe_make();
+    if (in != NULL) {
+        Pipe pip2 = {0};
+        pip2 = pipe_make();
+        fdin = &pip2.read;
+        write(pip2.write, in->items, in->count);
+        close(pip2.write);
+    }
+
+    p = nob_cmd_run_async_io(cmd, fdin, &pip.write);
+
+    if (fdin) close(*fdin);
+
+    close(pip.write);
+
+    if (p == NOB_INVALID_PROC) return false;
+    nob_proc_wait(p);
+
+    char buffer[NOB_DA_INIT_CAP];
+    ssize_t len = 0;
+    while ( (len = read(pip.read, &buffer, NOB_DA_INIT_CAP)) > 0) {
+        nob_sb_append_buf(out, buffer, len);
+    }
+    nob_sb_append_null(out);
+
+    close(pip.read);
+    return true;
 }
 
 void nob_cmd_render(Nob_Cmd cmd, Nob_String_Builder *render)
